@@ -40,15 +40,18 @@ jobs:
               Start-Sleep -Milliseconds 500
               $app.Refresh()
               if ($app.HasExited) { throw "EXE exited during startup with code $($app.ExitCode)" }
-              if ($app.MainWindowHandle -ne 0) { break }
+              # PyInstaller onefile starts a child process that owns the GUI.
+              $gui = Get-Process -Name AnimalShogi -ErrorAction SilentlyContinue |
+                Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+              if ($gui) { break }
             }
-            if ($app.MainWindowHandle -eq 0) { throw "EXE has no GUI window after 30 seconds" }
-            Write-Output "GUI window detected: $($app.MainWindowTitle)"
+            if (-not $gui) { throw "EXE has no GUI window after 30 seconds" }
+            Write-Output "GUI window detected: $($gui.MainWindowTitle)"
           } catch {
             Write-Output "::error::$($_.Exception.Message)"
             throw
           } finally {
-            if ($app -and -not $app.HasExited) { Stop-Process -Id $app.Id }
+            Get-Process -Name AnimalShogi -ErrorAction SilentlyContinue | Stop-Process -Force
           }
       - uses: actions/upload-artifact@v4
         with:
