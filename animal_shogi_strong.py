@@ -54,10 +54,27 @@ class Position:
         self.turn = turn
         self.winner = None
         self.reason = None
+        self.occurrences = {}
 
     @property
     def finished(self):
         return self.reason is not None
+
+    def key(self):
+        """Repetition includes side to move and hand counts, not hand order."""
+        board = tuple((p.name, p.owner, p.promoted) if p else None
+                      for row in self.board for p in row)
+        hands = tuple(tuple(sorted(p.name for p in self.hands[owner]))
+                      for owner in (0, 1))
+        return board, hands, self.turn
+
+    def start_history(self):
+        self.occurrences = {self.key(): 1}
+
+    def attacked(self, r, c, by_owner):
+        # Check geometric attacks: self-check is allowed in animal shogi.
+        return any(p and p.owner == by_owner and (r - sr, c - sc) in p.moves()
+                   for sr, row in enumerate(self.board) for sc, p in enumerate(row))
 
     def clone(self):
         def copy_piece(p):
@@ -66,6 +83,7 @@ class Position:
                           {owner: [copy_piece(p) for p in pieces]
                            for owner, pieces in self.hands.items()}, self.turn)
         result.winner, result.reason = self.winner, self.reason
+        result.occurrences = self.occurrences.copy()
         return result
 
     def adjudicate_capture(self):
@@ -104,6 +122,8 @@ class Position:
     def play(self, move):
         if move not in self.legal_moves():
             raise ValueError('Illegal move or finished game')
+        if not self.occurrences:
+            self.start_history()
         player = self.turn
         if move[0] == 'move':
             _, sr, sc, r, c = move
@@ -117,11 +137,19 @@ class Position:
                     self.hands[player].append(Piece(target.name, player))
             if piece.name == 'chick' and r == (0 if player == 0 else ROWS - 1):
                 piece.promoted = True
+            if (not self.finished and piece.name == 'lion'
+                    and r == (0 if player == 0 else ROWS - 1)
+                    and not self.attacked(r, c, 1 - player)):
+                self.winner, self.reason = player, 'try'
         else:
             _, idx, r, c = move
             piece = self.hands[player].pop(idx)
             self.board[r][c] = Piece(piece.name, player)
         self.turn = 1 - player
+        key = self.key()
+        self.occurrences[key] = self.occurrences.get(key, 0) + 1
+        if not self.finished and self.occurrences[key] >= 3:
+            self.reason = 'repetition'
 
 
 def evaluate(position):
@@ -186,6 +214,7 @@ class Game:
         # allow player to choose to play second
         if not messagebox.askyesno('Turn Order', 'Play first? (Yes: first, No: second)'):
             self.turn = 1
+        self.position.start_history()
         self.draw()
         if self.turn == 1:
             self.ai_callback = self.window.after(500, self.ai_move)
@@ -220,9 +249,11 @@ class Game:
             self.window.after_cancel(self.ai_callback)
             self.ai_callback = None
         if self.position.winner is None:
-            text = 'Draw!'
+            text = 'Draw! (Threefold repetition)'
         else:
             text = 'Computer wins!' if self.position.winner == 1 else 'Player 1 wins!'
+            if self.position.reason == 'try':
+                text += ' (Try)'
         messagebox.showinfo('Game Over', text)
         self.window.destroy()
 
