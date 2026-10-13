@@ -45,11 +45,159 @@ class Piece:
                 return [(forward,0)]
         return []
 
+class Position:
+    """Shared rule state used by both the GUI and the search."""
+
+    def __init__(self, board=None, hands=None, turn=0):
+        self.board = board if board is not None else [[None] * COLS for _ in range(ROWS)]
+        self.hands = hands if hands is not None else {0: [], 1: []}
+        self.turn = turn
+        self.winner = None
+        self.reason = None
+        self.occurrences = {}
+
+    @property
+    def finished(self):
+        return self.reason is not None
+
+    def key(self):
+        """Repetition includes side to move and hand counts, not hand order."""
+        board = tuple((p.name, p.owner, p.promoted) if p else None
+                      for row in self.board for p in row)
+        hands = tuple(tuple(sorted(p.name for p in self.hands[owner]))
+                      for owner in (0, 1))
+        return board, hands, self.turn
+
+    def start_history(self):
+        self.occurrences = {self.key(): 1}
+
+    def attacked(self, r, c, by_owner):
+        # Check geometric attacks: self-check is allowed in animal shogi.
+        return any(p and p.owner == by_owner and (r - sr, c - sc) in p.moves()
+                   for sr, row in enumerate(self.board) for sc, p in enumerate(row))
+
+    def clone(self):
+        def copy_piece(p):
+            return Piece(p.name, p.owner, p.promoted) if p else None
+        result = Position([[copy_piece(p) for p in row] for row in self.board],
+                          {owner: [copy_piece(p) for p in pieces]
+                           for owner, pieces in self.hands.items()}, self.turn)
+        result.winner, result.reason = self.winner, self.reason
+        result.occurrences = self.occurrences.copy()
+        return result
+
+    def adjudicate_capture(self):
+        if self.finished:
+            return
+        lions = {p.owner for row in self.board for p in row
+                 if p and p.name == 'lion'}
+        if len(lions) == 1:
+            self.winner = next(iter(lions))
+            self.reason = 'capture'
+
+    def legal_moves(self):
+        self.adjudicate_capture()
+        if self.finished:
+            return []
+        moves = []
+        for r, row in enumerate(self.board):
+            for c, p in enumerate(row):
+                if p is None or p.owner != self.turn:
+                    continue
+                for dr, dc in p.moves():
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < ROWS and 0 <= nc < COLS:
+                        target = self.board[nr][nc]
+                        if target is None or target.owner != self.turn:
+                            moves.append(('move', r, c, nr, nc))
+        for idx, p in enumerate(self.hands[self.turn]):
+            if p.name == 'lion':
+                continue
+            for r in range(ROWS):
+                for c in range(COLS):
+                    if self.board[r][c] is None:
+                        moves.append(('drop', idx, r, c))
+        return moves
+
+    def play(self, move):
+        if move not in self.legal_moves():
+            raise ValueError('Illegal move or finished game')
+        if not self.occurrences:
+            self.start_history()
+        player = self.turn
+        if move[0] == 'move':
+            _, sr, sc, r, c = move
+            piece, target = self.board[sr][sc], self.board[r][c]
+            self.board[sr][sc] = None
+            self.board[r][c] = piece
+            if target:
+                if target.name == 'lion':
+                    self.winner, self.reason = player, 'capture'
+                else:
+                    self.hands[player].append(Piece(target.name, player))
+            if piece.name == 'chick' and r == (0 if player == 0 else ROWS - 1):
+                piece.promoted = True
+            if (not self.finished and piece.name == 'lion'
+                    and r == (0 if player == 0 else ROWS - 1)
+                    and not self.attacked(r, c, 1 - player)):
+                self.winner, self.reason = player, 'try'
+        else:
+            _, idx, r, c = move
+            piece = self.hands[player].pop(idx)
+            self.board[r][c] = Piece(piece.name, player)
+        self.turn = 1 - player
+        key = self.key()
+        self.occurrences[key] = self.occurrences.get(key, 0) + 1
+        if not self.finished and self.occurrences[key] >= 3:
+            self.reason = 'repetition'
+
+
+def evaluate(position):
+    values = {'lion': 1000, 'elephant': 5, 'giraffe': 5, 'chick': 1}
+    total = 0
+    for r, row in enumerate(position.board):
+        for p in row:
+            if p:
+                value = 3 if p.promoted else values[p.name]
+                if p.name == 'chick' and not p.promoted:
+                    value += ROWS - r if p.owner == 0 else r + 1
+                total += value if p.owner == 1 else -value
+    for owner, pieces in position.hands.items():
+        for p in pieces:
+            total += values[p.name] if owner == 1 else -values[p.name]
+    return total
+
+
+def search(position, depth=3, alpha=float('-inf'), beta=float('inf')):
+    position.adjudicate_capture()
+    if position.finished:
+        score = 0 if position.winner is None else (10000 + depth) * (1 if position.winner == 1 else -1)
+        return score, None
+    moves = position.legal_moves()
+    if depth == 0 or not moves:
+        return evaluate(position), None
+    maximizing = position.turn == 1
+    best = float('-inf') if maximizing else float('inf')
+    choice = None
+    for move in moves:
+        child = position.clone()
+        child.play(move)
+        score, _ = search(child, depth - 1, alpha, beta)
+        if choice is None or (score > best if maximizing else score < best):
+            best, choice = score, move
+        if maximizing:
+            alpha = max(alpha, best)
+        else:
+            beta = min(beta, best)
+        if beta <= alpha:
+            break
+    return best, choice
+
+
 class Game:
     def __init__(self):
-        self.board = [[None for _ in range(COLS)] for _ in range(ROWS)]
-        self.hands = {0: [], 1: []}
-        self.turn = 0  # 0 bottom, 1 top
+        self.position = Position()
+        self.ai_callback = None
         self.selected = None  # (row,col) or ('hand', index)
         self.window = tk.Tk()
         self.window.title('Animal Shogi (Strong AI)')
@@ -66,171 +214,57 @@ class Game:
         # allow player to choose to play second
         if not messagebox.askyesno('Turn Order', 'Play first? (Yes: first, No: second)'):
             self.turn = 1
+        self.position.start_history()
         self.draw()
         if self.turn == 1:
-            self.window.after(500, self.ai_move)
+            self.ai_callback = self.window.after(500, self.ai_move)
+
+    @property
+    def board(self):
+        return self.position.board
+
+    @property
+    def hands(self):
+        return self.position.hands
+
+    @property
+    def turn(self):
+        return self.position.turn
+
+    @turn.setter
+    def turn(self, value):
+        self.position.turn = value
 
     def ai_move(self):
-        if self.turn != 1:
+        self.ai_callback = None
+        self.position.adjudicate_capture()
+        if self.position.finished or self.turn != 1:
             return
+        _, choice = search(self.position.clone())
+        if choice is not None:
+            self.make_move(choice)
 
-        def piece_value(p: Piece) -> int:
-            if p.name == 'lion':
-                return 1000
-            if p.name in ('elephant', 'giraffe'):
-                return 5
-            if p.name == 'chick':
-                return 3 if p.promoted else 1
-            return 0
-
-        def evaluate(board, hands):
-            lion0 = False
-            lion1 = False
-            total = 0
-            for r in range(ROWS):
-                for c in range(COLS):
-                    p = board[r][c]
-                    if p:
-                        if p.name == 'lion':
-                            if p.owner == 0:
-                                lion0 = True
-                            else:
-                                lion1 = True
-                        val = piece_value(p)
-                        pos_bonus = 0
-                        if p.name == 'chick' and not p.promoted:
-                            pos_bonus = (ROWS - r) if p.owner == 0 else (r + 1)
-                        val += pos_bonus
-                        total += val if p.owner == 1 else -val
-            if not lion0:
-                return float('inf')
-            if not lion1:
-                return float('-inf')
-            for owner, pieces in hands.items():
-                for p in pieces:
-                    val = piece_value(p)
-                    pos_bonus = 0
-                    if p.name == 'chick' and not p.promoted:
-                        pos_bonus = ROWS if owner == 0 else 1
-                    val += pos_bonus
-                    total += val if owner == 1 else -val
-            return total
-
-        def clone_board(board):
-            return [[Piece(p.name, p.owner, p.promoted) if p else None for p in row] for row in board]
-
-        def clone_hands(hands):
-            return {0: [Piece(p.name, p.owner, p.promoted) for p in hands[0]],
-                    1: [Piece(p.name, p.owner, p.promoted) for p in hands[1]]}
-
-        def legal_moves_board(board, r, c, piece):
-            moves = []
-            for dr, dc in piece.moves():
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < ROWS and 0 <= nc < COLS:
-                    target = board[nr][nc]
-                    if not target or target.owner != piece.owner:
-                        moves.append((nr, nc))
-            return moves
-
-        def generate_moves(board, hands, player):
-            moves = []
-            for r in range(ROWS):
-                for c in range(COLS):
-                    piece = board[r][c]
-                    if piece and piece.owner == player:
-                        for nr, nc in legal_moves_board(board, r, c, piece):
-                            moves.append(("move", r, c, nr, nc))
-            for idx, piece in enumerate(hands[player]):
-                for r in range(ROWS):
-                    for c in range(COLS):
-                        if board[r][c] is None:
-                            moves.append(("drop", idx, r, c))
-            return moves
-
-        def apply_move(board, hands, move, player):
-            if move[0] == "move":
-                _, sr, sc, r, c = move
-                piece = board[sr][sc]
-                board[sr][sc] = None
-                target = board[r][c]
-                if target:
-                    target.owner = player
-                    target.promoted = False
-                    hands[player].append(target)
-                board[r][c] = Piece(piece.name, player, piece.promoted)
-                if piece.name == 'chick' and not piece.promoted:
-                    if (player == 0 and r == 0) or (player == 1 and r == ROWS - 1):
-                        board[r][c].promoted = True
-            else:
-                _, idx, r, c = move
-                piece = hands[player][idx]
-                board[r][c] = Piece(piece.name, player, piece.promoted)
-                del hands[player][idx]
-            return board, hands
-
-        def minimax(board, hands, depth, player, alpha, beta):
-            if depth == 0:
-                return evaluate(board, hands), None
-            moves = generate_moves(board, hands, player)
-            if not moves:
-                return evaluate(board, hands), None
-            if player == 1:
-                best = float('-inf')
-                best_move = None
-                for mv in moves:
-                    nb, nh = apply_move(clone_board(board), clone_hands(hands), mv, player)
-                    score, _ = minimax(nb, nh, depth - 1, 0, alpha, beta)
-                    if score > best:
-                        best = score
-                        best_move = mv
-                    alpha = max(alpha, best)
-                    if beta <= alpha:
-                        break
-                return best, best_move
-            else:
-                best = float('inf')
-                best_move = None
-                for mv in moves:
-                    nb, nh = apply_move(clone_board(board), clone_hands(hands), mv, player)
-                    score, _ = minimax(nb, nh, depth - 1, 1, alpha, beta)
-                    if score < best:
-                        best = score
-                        best_move = mv
-                    beta = min(beta, best)
-                    if beta <= alpha:
-                        break
-                return best, best_move
-
-        _, choice = minimax(clone_board(self.board), clone_hands(self.hands), 3, 1, float('-inf'), float('inf'))
-        if choice is None:
-            self.end_turn()
-            return
-
-        if choice[0] == "move":
-            _, sr, sc, r, c = choice
-            piece = self.board[sr][sc]
-            target = self.board[r][c]
-            self.board[r][c] = piece
-            self.board[sr][sc] = None
-            if target:
-                target.owner = 1
-                target.promoted = False
-                self.hands[1].append(target)
-                if target.name == 'lion':
-                    messagebox.showinfo('Game Over', 'Computer wins!')
-                    self.window.destroy()
-                    return
-            if piece.name == 'chick' and not piece.promoted and r == ROWS - 1:
-                piece.promoted = True
+    def finish_game(self):
+        if self.ai_callback is not None:
+            self.window.after_cancel(self.ai_callback)
+            self.ai_callback = None
+        if self.position.winner is None:
+            text = 'Draw! (Threefold repetition)'
         else:
-            _, idx, r, c = choice
-            piece = self.hands[1][idx]
-            self.board[r][c] = Piece(piece.name, 1, piece.promoted)
-            del self.hands[1][idx]
+            text = 'Computer wins!' if self.position.winner == 1 else 'Player 1 wins!'
+            if self.position.reason == 'try':
+                text += ' (Try)'
+        messagebox.showinfo('Game Over', text)
+        self.window.destroy()
 
+    def make_move(self, move):
+        self.position.play(move)
+        self.selected = None
         self.draw()
-        self.end_turn()
+        if self.position.finished:
+            self.finish_game()
+        else:
+            self.end_turn()
 
     def setup_board(self):
         # Player 1 (bottom)
@@ -286,65 +320,32 @@ class Game:
         return 0 <= r < ROWS and 0 <= c < COLS
 
     def legal_moves(self, r, c, piece):
-        moves = []
-        for dr, dc in piece.moves():
-            nr, nc = r + dr, c + dc
-            if self.in_bounds(nr, nc):
-                target = self.board[nr][nc]
-                if not target or target.owner != piece.owner:
-                    moves.append((nr, nc))
-        return moves
+        if not self.in_bounds(r, c) or self.board[r][c] is not piece:
+            return []
+        return [(mv[3], mv[4]) for mv in self.position.legal_moves()
+                if mv[0] == 'move' and mv[1:3] == (r, c)]
 
     def on_click(self, event):
-        if self.turn != 0:
+        if self.position.finished or self.turn != 0 or event.x < 0 or event.y < 0:
             return
-
         if event.y >= ROWS * CELL_SIZE:
             index = event.x // self.hand_size
-            if index < len(self.hands[self.turn]):
+            if event.y < ROWS * CELL_SIZE + self.hand_size and index < len(self.hands[0]):
                 self.selected = ('hand', index)
                 self.draw()
             return
-
-        c = event.x // CELL_SIZE
-        r = event.y // CELL_SIZE
+        c, r = event.x // CELL_SIZE, event.y // CELL_SIZE
         if not self.in_bounds(r, c):
             return
         if self.selected:
             if self.selected[0] == 'hand':
-                index = self.selected[1]
-                piece = self.hands[self.turn][index]
-                if self.board[r][c] is None:
-                    self.board[r][c] = Piece(piece.name, self.turn)
-                    del self.hands[self.turn][index]
-                    self.end_turn()
-                self.selected = None
+                move = ('drop', self.selected[1], r, c)
             else:
-                sr, sc = self.selected
-                piece = self.board[sr][sc]
-                if piece and piece.owner == self.turn:
-                    if (r, c) in self.legal_moves(sr, sc, piece):
-                        target = self.board[r][c]
-                        if target and target.owner == self.turn:
-                            # do not allow capturing own piece
-                            self.selected = None
-                            self.draw()
-                            return
-                        self.board[r][c] = piece
-                        self.board[sr][sc] = None
-                        if target:
-                            target.owner = self.turn
-                            target.promoted = False
-                            self.hands[self.turn].append(target)
-                            if target.name == 'lion':
-                                messagebox.showinfo('Game Over', f'Player {self.turn+1} wins!')
-                                self.window.destroy()
-                                return
-                        if piece.name == 'chick' and not piece.promoted:
-                            if (piece.owner == 0 and r == 0) or (piece.owner == 1 and r == ROWS - 1):
-                                piece.promoted = True
-                        self.end_turn()
-                self.selected = None
+                move = ('move', *self.selected, r, c)
+            self.selected = None
+            if move in self.position.legal_moves():
+                self.make_move(move)
+                return
         else:
             piece = self.board[r][c]
             if piece and piece.owner == self.turn:
@@ -352,10 +353,9 @@ class Game:
         self.draw()
 
     def end_turn(self):
-        self.turn = 1 - self.turn
-        self.draw()
-        if self.turn == 1:
-            self.window.after(500, self.ai_move)
+        # Position.play already switches the turn; never advance after game over.
+        if not self.position.finished and self.turn == 1:
+            self.ai_callback = self.window.after(500, self.ai_move)
 
     def run(self):
         self.window.mainloop()
