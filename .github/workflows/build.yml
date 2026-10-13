@@ -1,0 +1,44 @@
+name: Build and test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y xvfb python3-tk
+      - run: xvfb-run -a python -m unittest discover -s tests -v
+      - run: python tools/build_browser.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: animal-shogi-browser
+          path: dist/animal-shogi.html
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pyinstaller==6.16.0
+      - run: python -m unittest discover -s tests -v
+      - run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name AnimalShogi animal_shogi_strong.py
+      - shell: pwsh
+        run: |
+          $app = Start-Process -FilePath dist/AnimalShogi.exe -PassThru
+          Start-Sleep -Seconds 5
+          if ($app.HasExited) { throw "EXE exited during startup" }
+          if ($app.MainWindowHandle -eq 0) { throw "EXE has no GUI window" }
+          Stop-Process -Id $app.Id
+      - uses: actions/upload-artifact@v4
+        with:
+          name: animal-shogi-windows
+          path: dist/AnimalShogi.exe
