@@ -33,11 +33,23 @@ jobs:
       - run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name AnimalShogi animal_shogi_strong.py
       - shell: pwsh
         run: |
-          $app = Start-Process -FilePath dist/AnimalShogi.exe -PassThru
-          Start-Sleep -Seconds 5
-          if ($app.HasExited) { throw "EXE exited during startup" }
-          if ($app.MainWindowHandle -eq 0) { throw "EXE has no GUI window" }
-          Stop-Process -Id $app.Id
+          $app = $null
+          try {
+            $app = Start-Process -FilePath "$pwd/dist/AnimalShogi.exe" -PassThru
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Milliseconds 500
+              $app.Refresh()
+              if ($app.HasExited) { throw "EXE exited during startup with code $($app.ExitCode)" }
+              if ($app.MainWindowHandle -ne 0) { break }
+            }
+            if ($app.MainWindowHandle -eq 0) { throw "EXE has no GUI window after 30 seconds" }
+            Write-Output "GUI window detected: $($app.MainWindowTitle)"
+          } catch {
+            Write-Output "::error::$($_.Exception.Message)"
+            throw
+          } finally {
+            if ($app -and -not $app.HasExited) { Stop-Process -Id $app.Id }
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: animal-shogi-windows
