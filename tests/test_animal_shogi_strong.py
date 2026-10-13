@@ -259,6 +259,26 @@ class RulesTests(unittest.TestCase):
             g.make_move.assert_not_called()
             g.window.after.assert_not_called()
 
+    def test_search_budget_returns_legal_move_and_keeps_history(self):
+        g = Game.__new__(Game)
+        g.position = Position()
+        g.setup_board()
+        p = g.position
+        p.start_history()
+        before = p.key(), p.occurrences.copy()
+        stats = {}
+        _, move = search(p, node_limit=40, stats=stats)
+        self.assertIn(move, p.legal_moves())
+        self.assertLessEqual(stats['nodes'], 41)
+        self.assertGreaterEqual(stats['depth'], 1)
+        self.assertEqual(before, (p.key(), p.occurrences))
+
+    def test_horizon_sees_opponents_immediate_lion_capture(self):
+        p = position(turn=1)
+        p.board[2][1] = Piece('giraffe', 1)
+        score, _ = search(p, depth=0)
+        self.assertGreater(score, 90000)
+
     def test_ai_chooses_try_win(self):
         p = Position(turn=1)
         p.board[2][0] = Piece('lion', 1)
