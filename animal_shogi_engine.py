@@ -119,6 +119,10 @@ class Position:
     def play(self, move):
         if move not in self.legal_moves():
             raise ValueError('Illegal move or finished game')
+        self._play_legal(move)
+
+    def _play_legal(self, move):
+        # Internal fast path: caller must obtain the move from legal_moves().
         if not self.occurrences:
             self.start_history()
         player = self.turn
@@ -149,45 +153,131 @@ class Position:
             self.reason = 'repetition'
 
 
+VALUES = {'lion': 0, 'elephant': 300, 'giraffe': 350, 'chick': 110}
+WIN = 100000
+
+
 def evaluate(position):
-    values = {'lion': 1000, 'elephant': 5, 'giraffe': 5, 'chick': 1}
-    total = 0
-    for r, row in enumerate(position.board):
-        for p in row:
-            if p:
-                value = 3 if p.promoted else values[p.name]
+    """CPU-centric material, mobility, promotion and lion safety."""
+    score = 0
+    for owner in (0, 1):
+        value = sum(VALUES[p.name] * 1.15 for p in position.hands[owner])
+        for r, row in enumerate(position.board):
+            for c, p in enumerate(row):
+                if p is None or p.owner != owner:
+                    continue
+                progress = 3 - r if owner == 0 else r
+                value += 320 if p.promoted else VALUES[p.name]
+                mobility = sum(0 <= r + dr < ROWS and 0 <= c + dc < COLS
+                               and (position.board[r + dr][c + dc] is None
+                                    or position.board[r + dr][c + dc].owner != owner)
+                               for dr, dc in p.moves())
+                value += mobility * 8
                 if p.name == 'chick' and not p.promoted:
-                    value += ROWS - r if p.owner == 0 else r + 1
-                total += value if p.owner == 1 else -value
-    for owner, pieces in position.hands.items():
-        for p in pieces:
-            total += values[p.name] if owner == 1 else -values[p.name]
-    return total
+                    value += progress * 25
+                if p.name == 'lion':
+                    value += progress * 35
+                    if position.attacked(r, c, 1 - owner):
+                        value -= 1200 if position.turn != owner else 250
+                    else:
+                        value += 60
+                elif position.attacked(r, c, 1 - owner):
+                    value -= (320 if p.promoted else VALUES[p.name]) * .25
+        score += value if owner == 1 else -value
+    return score
 
 
-def search(position, depth=3, alpha=float('-inf'), beta=float('inf')):
+def search(position, depth=10, alpha=float('-inf'), beta=float('inf'),
+           node_limit=20000, stats=None):
+    """Iterative deepening alpha-beta with a deterministic work budget.
+
+    Scores are always from CPU/player 1's perspective. Repetition history is
+    retained in every branch. Cached moves only affect ordering, never scores.
+    """
     position.adjudicate_capture()
+    nodes = 0
+    completed = 0
+    preferred = {}
+
+    class BudgetExhausted(Exception):
+        pass
+
+    def ordered(state, moves):
+        favored = preferred.get(state.key())
+        def priority(move):
+            score = 1000000 if move == favored else 0
+            if move[0] == 'move':
+                _, sr, sc, r, c = move
+                piece, target = state.board[sr][sc], state.board[r][c]
+                if target:
+                    score += 500000 if target.name == 'lion' else 1000 + VALUES[target.name]
+                if piece.name == 'lion' and r == (0 if piece.owner == 0 else 3):
+                    score += 5000
+                if piece.name == 'chick' and r == (0 if piece.owner == 0 else 3):
+                    score += 800
+            return score
+        return sorted(moves, key=priority, reverse=True)
+
+    def visit(state, remaining, low, high, ply):
+        nonlocal nodes
+        nodes += 1
+        if node_limit is not None and nodes > node_limit:
+            raise BudgetExhausted
+        if state.finished:
+            if state.winner is None:
+                return 0, None
+            return (WIN - ply) * (1 if state.winner == 1 else -1), None
+        moves = state.legal_moves()
+        if not moves:
+            return evaluate(state), None
+        if remaining == 0:
+            # Do not miss a capture or safe try just beyond the horizon.
+            for move in moves:
+                if move[0] != 'move':
+                    continue
+                _, sr, sc, r, c = move
+                target, piece = state.board[r][c], state.board[sr][sc]
+                if ((target and target.name == 'lion') or
+                    (piece.name == 'lion' and r == (0 if piece.owner == 0 else 3))):
+                    child = state.clone()
+                    child._play_legal(move)
+                    if child.finished and child.winner == state.turn:
+                        return (WIN - ply - 1) * (1 if state.turn == 1 else -1), None
+            return evaluate(state), None
+        maximizing = state.turn == 1
+        best = float('-inf') if maximizing else float('inf')
+        choice = None
+        for move in ordered(state, moves):
+            child = state.clone()
+            child._play_legal(move)
+            value, _ = visit(child, remaining - 1, low, high, ply + 1)
+            if choice is None or (value > best if maximizing else value < best):
+                best, choice = value, move
+            if maximizing:
+                low = max(low, best)
+            else:
+                high = min(high, best)
+            if high <= low:
+                break
+        preferred[state.key()] = choice
+        return best, choice
+
     if position.finished:
-        score = 0 if position.winner is None else (10000 + depth) * (1 if position.winner == 1 else -1)
-        return score, None
-    moves = position.legal_moves()
-    if depth == 0 or not moves:
-        return evaluate(position), None
-    maximizing = position.turn == 1
-    best = float('-inf') if maximizing else float('inf')
-    choice = None
-    for move in moves:
-        child = position.clone()
-        child.play(move)
-        score, _ = search(child, depth - 1, alpha, beta)
-        if choice is None or (score > best if maximizing else score < best):
-            best, choice = score, move
-        if maximizing:
-            alpha = max(alpha, best)
-        else:
-            beta = min(beta, best)
-        if beta <= alpha:
-            break
-    return best, choice
-
-
+        result = (0 if position.winner is None else WIN * (1 if position.winner == 1 else -1), None)
+    elif depth == 0:
+        result = visit(position, 0, alpha, beta, 0)
+    else:
+        moves = position.legal_moves()
+        result = (evaluate(position), moves[0] if moves else None)
+        for current_depth in range(1, depth + 1):
+            try:
+                candidate = visit(position, current_depth, alpha, beta, 0)
+            except BudgetExhausted:
+                break
+            result = candidate
+            completed = current_depth
+            if abs(result[0]) >= WIN - current_depth:
+                break
+    if stats is not None:
+        stats.update(nodes=nodes, depth=completed)
+    return result
